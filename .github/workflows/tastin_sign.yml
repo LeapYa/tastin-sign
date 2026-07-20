@@ -1,0 +1,45 @@
+name: 塔斯汀每日签到
+
+on:
+  schedule:
+    # 每天早上 9:05 执行（UTC+8 = UTC 01:05）
+    - cron: "5 1 * * *"
+  workflow_dispatch: # 支持手动触发
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Shanghai
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 设置上海时区
+        run: |
+          sudo ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          echo Asia/Shanghai | sudo tee /etc/timezone > /dev/null
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt --quiet
+
+      - name: 执行签到
+        env:
+          TASTIN_USER_TOKEN: ${{ secrets.TASTIN_USER_TOKEN }}
+          TASTIN_MEMBER_PHONE: ${{ secrets.TASTIN_MEMBER_PHONE }}
+          TASTIN_SHOP_ID: ${{ secrets.TASTIN_SHOP_ID || '28416' }}
+          TASTIN_VERSION: ${{ secrets.TASTIN_VERSION || '3.78.0' }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT || '465' }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+          SMTP_NOTIFY_SIGN: ${{ secrets.SMTP_NOTIFY_SIGN || '' }}
+        run: python tastin_sign.py
