@@ -38,6 +38,12 @@ def _now() -> datetime:
 # 是否在 GitHub Actions 环境中运行（Actions 的海外 IP 必定被 WAF 拦截，直接走代理）
 _IN_ACTIONS = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
 
+# 触发本次运行的 cron 表达式（工作流通过 github.event.schedule 注入；手动触发/本地为空）。
+# 每天多个时段重试时，只让“首个时段(北京 9:05)”或手动/本地运行负责告警（标红 + 发邮件），
+# 其余时段即使检测到 token 过期/签到失败也静音退出，保证一天最多一封失败邮件。
+_CRON = os.environ.get("TASTIN_CRON", "").strip()
+_IS_PRIMARY_SLOT = (_CRON == "" or _CRON == "5 1 * * *")
+
 # GitHub Actions 环境证书链可能不完整，跳过验证
 _ssl_ctx = ssl.create_default_context()
 _ssl_ctx.check_hostname = False
@@ -92,6 +98,12 @@ def _is_waf_response(result: dict) -> bool:
     if "<!doctype" in msg.lower() or "<html" in msg.lower():
         return True
     return False
+
+
+def _is_network_error(result: dict) -> bool:
+    """判断是否为网络/代理故障（请求未送达服务器），区别于服务器返回的业务错误。
+    code == -1 是脚本内部标记：直连异常，或代理池整体失效导致请求发不出去。"""
+    return result.get("code") == -1
 
 
 def _direct_request(method: str, path: str, body: dict | None = None) -> dict:
@@ -156,12 +168,13 @@ def _get_proxy_client():
 
 
 def _proxy_request(method: str, path: str, body: dict | None = None) -> dict:
-    """通过国内代理发送请求（静默重试 3 次，每次间隔 3s 等待代理源刷新）"""
+    """通过国内代理发送请求（静默重试 3 次，失败后丢弃旧代理池、重新抓取一批新代理再试）"""
     import time
-    client = _get_proxy_client()
+    global _proxy_client
     url = BASE_URL + path
     last_err = {"code": -1, "msg": "proxy: all attempts failed", "result": None}
     for attempt in range(3):
+        client = _get_proxy_client()
         try:
             if method.upper() == "POST":
                 resp = client.post(url, headers=HEADERS, json=body, timeout=15, verify=False)
@@ -174,7 +187,9 @@ def _proxy_request(method: str, path: str, body: dict | None = None) -> dict:
         except Exception as e:
             last_err = {"code": -1, "msg": f"proxy error: {e}", "result": None}
         if attempt < 2:
-            print(f"[proxy] 请求失败，{3}s 后重试 ({attempt+1}/3)...")
+            # 当前代理池可能整体失效，丢弃后重新抓取一批新代理再试（应对某天免费代理集体挂掉）
+            print(f"[proxy] 请求失败，刷新代理池后重试 ({attempt+1}/3)...")
+            _proxy_client = None
             time.sleep(3)
     return last_err
 
@@ -272,15 +287,23 @@ def discover_activity_id() -> int:
 
 
 # ============ 业务逻辑 ============
-def check_token() -> bool:
-    """验证 token 是否有效"""
+def check_token() -> str:
+    """验证 token 是否有效。
+    返回值：
+      "ok"      - token 有效
+      "network" - 网络/代理故障，连不上服务器，无法判断（非 token 问题）
+      "expired" - 服务器明确拒绝，token 已失效
+    """
     res = api_request("POST", "/api/wx/point/myPoint", {})
     if res.get("code") == 200:
         point = res.get("result", {}).get("point", "?")
         print(f"[check] token 有效，当前积分: {point}")
-        return True
+        return "ok"
+    if _is_network_error(res):
+        print(f"[check] 网络/代理故障，无法验证 token（并非过期）: {res.get('msg')}")
+        return "network"
     print(f"[check] token 无效或已过期: {res.get('msg')}")
-    return False
+    return "expired"
 
 
 def get_sign_info(activity_id: int) -> dict | None:
@@ -334,18 +357,31 @@ def main():
 
     # 1. 验证 token
     print()
-    if not check_token():
+    token_status = check_token()
+    if token_status == "network":
+        # 免费代理池当天可能整体失效，这不是 token 问题：不误报过期、也不发过期邮件。
+        # 工作流每天多个时段重试（见 tastin_sign.yml），本次跳过、稍后自动再签，
+        # 故以“成功”退出，避免把可自愈的网络抖动标记为失败、造成多次失败邮件骚扰。
+        print("\n[WARN] 网络/代理故障，本次无法连接塔斯汀服务器（token 未过期）")
+        print("[WARN] 通常是免费代理临时全部失效，无需更新 Secrets，稍后的定时任务会自动重试")
+        print("::warning::代理/网络故障，本次签到跳过，等待下一个定时任务重试（非 token 过期）")
+        sys.exit(0)
+    if token_status == "expired":
         print("\n[ERROR] token 已失效，请重新抓包获取新 token 并更新 GitHub Secrets")
-        print("::error::塔斯汀 token 已过期，需要手动更新！")
-        send_email(
-            "⚠️ 塔斯汀签到 Token 已过期",
-            "<h3>塔斯汀签到 Token 已失效</h3>"
-            "<p>请重新运行 <code>get_token.py</code> 获取新 token，"
-            "然后更新 GitHub 仓库的 Secrets：</p>"
-            "<ul><li>TASTIN_USER_TOKEN</li><li>TASTIN_MEMBER_PHONE</li></ul>"
-            f"<p><small>时间: {_now().strftime('%Y-%m-%d %H:%M:%S')}</small></p>",
-        )
-        sys.exit(1)
+        if _IS_PRIMARY_SLOT:
+            print("::error::塔斯汀 token 已过期，需要手动更新！")
+            send_email(
+                "⚠️ 塔斯汀签到 Token 已过期",
+                "<h3>塔斯汀签到 Token 已失效</h3>"
+                "<p>请重新运行 <code>get_token.py</code> 获取新 token，"
+                "然后更新 GitHub 仓库的 Secrets：</p>"
+                "<ul><li>TASTIN_USER_TOKEN</li><li>TASTIN_MEMBER_PHONE</li></ul>"
+                f"<p><small>时间: {_now().strftime('%Y-%m-%d %H:%M:%S')}</small></p>",
+            )
+            sys.exit(1)
+        # 非首个时段：只提示，不标红、不发邮件（每天 9:05 首个时段已负责告警），避免一天多封
+        print("::warning::token 已过期，本时段静音（每天首个时段 9:05 已负责告警）")
+        sys.exit(0)
 
     # 2. 自动发现当前签到活动 ID
     print()
@@ -374,17 +410,26 @@ def main():
         print(f"[sign] 今天已经签过了: {res['msg']}")
         sign_ok = True
         sign_msg = "今天已经签过了"
+    elif _is_network_error(res):
+        # 网络/代理故障，并非真正的签到失败：本次跳过、等待下一个定时任务重试，以成功退出避免误导性告警
+        print(f"[sign] 网络/代理故障，本次签到未完成（非账号问题）: {res.get('msg')}")
+        print("::warning::代理/网络故障，本次签到跳过，等待下一个定时任务重试")
+        sys.exit(0)
     else:
         sign_msg = res.get("msg", "未知错误")
         print(f"[sign] 签到失败: {sign_msg}")
-        print("::error::签到失败，请检查日志")
-        if SMTP_NOTIFY_SIGN:
-            send_email(
-                "❌ 塔斯汀签到失败",
-                f"<h3>塔斯汀签到失败</h3><p>错误信息: {sign_msg}</p>"
-                f"<p><small>时间: {_now().strftime('%Y-%m-%d %H:%M:%S')}</small></p>",
-            )
-        sys.exit(1)
+        if _IS_PRIMARY_SLOT:
+            print("::error::签到失败，请检查日志")
+            if SMTP_NOTIFY_SIGN:
+                send_email(
+                    "❌ 塔斯汀签到失败",
+                    f"<h3>塔斯汀签到失败</h3><p>错误信息: {sign_msg}</p>"
+                    f"<p><small>时间: {_now().strftime('%Y-%m-%d %H:%M:%S')}</small></p>",
+                )
+            sys.exit(1)
+        # 非首个时段：静音退出，避免一天多封失败邮件
+        print("::warning::签到失败，本时段静音（每天首个时段 9:05 已负责告警）")
+        sys.exit(0)
 
     # 5. 最终积分
     print()
@@ -396,8 +441,8 @@ def main():
 
     print("\n[done] 签到流程完成")
 
-    # 6. 发送成功通知（仅在开启 SMTP_NOTIFY_SIGN 时）
-    if SMTP_NOTIFY_SIGN:
+    # 6. 发送成功通知（仅在开启 SMTP_NOTIFY_SIGN 且为每天首个时段/手动触发时，避免一天多封）
+    if SMTP_NOTIFY_SIGN and _IS_PRIMARY_SLOT:
         send_email(
             "✅ 塔斯汀签到成功",
             f"<h3>塔斯汀每日签到</h3>"
