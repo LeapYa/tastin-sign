@@ -13,12 +13,13 @@
 代理说明：
   塔斯汀 API 使用阿里云 WAF，会拦截海外数据中心 IP（如 GitHub Actions）。
   脚本会先尝试直连，若检测到 WAF 拦截（403/405），自动切换到国内免费代理重试。
-  依赖：pip install pyfreeproxy（仅代理模式需要，本地直连无需安装）
+  代理库使用改进版 freeproxy（fork）：用 ip2region 本地离线库做地理定位（替代逐个 IP 调外部
+  地理API），并"找到几个可用代理即停"，把原本几十分钟~数小时的代理准备压缩到秒级。
+  依赖见 requirements.txt（仅代理模式需要，本地直连无需安装）。
 """
 
 import json
 import os
-os.environ["TQDM_DISABLE"] = "1"  # 必须在 freeproxy import 之前，否则 tqdm 进度条无法抑制
 import ssl
 import sys
 import urllib.request
@@ -85,8 +86,16 @@ HEADERS = {
 
 
 # ============ 请求工具（直连 + 代理回退） ============
-_proxy_client = None
+_proxy_client = None      # 复用同一个 ProxiedSessionClient（内含已抓取的候选代理池）
+_working_proxies = []     # fetch_working 验证出的可用代理（requests 格式 dict 列表）
 _waf_blocked = False
+
+# 代理源：只用免浏览器抓取的国内源（快代理/齐云/开心/89ip/谷德/TheSpeedX/ProxyScrape）
+_PROXY_SOURCES = [
+    "KuaidailiProxiedSession", "QiyunipProxiedSession", "KxdailiProxiedSession",
+    "IP89ProxiedSession", "GoodIPSProxiedSession", "TheSpeedXProxiedSession",
+    "ProxyScrapeProxiedSession",
+]
 
 
 def _is_waf_response(result: dict) -> bool:
@@ -121,76 +130,74 @@ def _direct_request(method: str, path: str, body: dict | None = None) -> dict:
         return {"code": -1, "msg": str(e), "result": None}
 
 
-def _get_proxy_client():
-    """懒初始化 freeproxy 代理客户端（仅国内 IP）"""
-    global _proxy_client
-    if _proxy_client is None:
+def _get_working_proxies() -> list:
+    """懒初始化：抓取国内免费代理，并直接拿塔斯汀接口并发验证，凑够几个可用代理即停。"""
+    global _proxy_client, _working_proxies
+    if _working_proxies:
+        return _working_proxies
+    try:
+        from freeproxy.freeproxy import ProxiedSessionClient
+    except ImportError:
+        print("[proxy] 错误：未安装代理库，请运行 pip install -r requirements.txt")
+        sys.exit(1)
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+
+    def _valid(resp):
+        # 能拿到 JSON 业务响应（含 code 字段）即证明该代理能连塔斯汀、并绕过了 WAF
         try:
-            from freeproxy.freeproxy import ProxiedSessionClient
-        except ImportError:
-            print("[proxy] 错误：未安装 pyfreeproxy，无法使用代理模式")
-            print("[proxy] 请运行: pip install pyfreeproxy")
-            sys.exit(1)
+            data = resp.json()
+            return isinstance(data, dict) and ("code" in data)
+        except Exception:
+            return False
 
-        # 抑制 requests 的 SSL 警告
-        try:
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        except ImportError:
-            pass
-
-        # 抑制 tqdm 进度条和 freeproxy WARNING 日志
-        import logging
-        logging.getLogger("freeproxy").setLevel(logging.ERROR)
-
-        print("[proxy] 正在获取国内免费代理...")
-        _proxy_client = ProxiedSessionClient(
-            proxy_sources=[
-                "KuaidailiProxiedSession",
-                "QiyunipProxiedSession",
-                "KxdailiProxiedSession",
-                "IP89ProxiedSession",
-                "GoodIPSProxiedSession",
-                "TheSpeedXProxiedSession",
-            ],
-            init_proxied_session_cfg={
-                "max_pages": 1,
-                "filter_rule": {
-                    "country_code": ["CN"],
-                    "protocol": ["http", "https"],
-                },
-            },
-            disable_print=True,
-            max_tries=15,
-        )
-        print("[proxy] 代理池初始化完成")
-    return _proxy_client
+    print("[proxy] 正在抓取国内免费代理...")
+    _proxy_client = ProxiedSessionClient(
+        proxy_sources=_PROXY_SOURCES,
+        init_proxied_session_cfg={
+            "max_pages": 2,  # 多抓几页；白天可用代理较少时提高命中率
+            "filter_rule": {"country_code": ["CN"], "protocol": ["http", "https"]},
+        },
+        disable_print=True,
+    )
+    print("[proxy] 并发验证代理（找到可用即停）...")
+    _working_proxies = _proxy_client.fetch_working(
+        test_url=BASE_URL + "/api/wx/point/myPoint",
+        headers=HEADERS, need=3, max_workers=80, timeout=12,
+        method="POST", json_body={}, is_valid=_valid,
+    )
+    print(f"[proxy] 可用代理 {len(_working_proxies)} 个")
+    return _working_proxies
 
 
-def _proxy_request(method: str, path: str, body: dict | None = None) -> dict:
-    """通过国内代理发送请求（静默重试 3 次，失败后丢弃旧代理池、重新抓取一批新代理再试）"""
-    import time
-    global _proxy_client
+def _proxy_request(method: str, path: str, body: dict | None = None, _refetch: bool = True) -> dict:
+    """通过已验证的可用代理发请求；某代理失效则剔除，全部失效再重新抓一批。"""
+    import requests
     url = BASE_URL + path
-    last_err = {"code": -1, "msg": "proxy: all attempts failed", "result": None}
-    for attempt in range(3):
-        client = _get_proxy_client()
+    proxies_list = _get_working_proxies()
+    last_err = {"code": -1, "msg": "proxy: no working proxy", "result": None}
+    for proxies in list(proxies_list):
         try:
             if method.upper() == "POST":
-                resp = client.post(url, headers=HEADERS, json=body, timeout=15, verify=False)
+                resp = requests.post(url, headers=HEADERS, json=body, proxies=proxies, timeout=15, verify=False)
             else:
-                resp = client.get(url, headers=HEADERS, timeout=15, verify=False)
+                resp = requests.get(url, headers=HEADERS, proxies=proxies, timeout=15, verify=False)
             result = resp.json()
             if result.get("code") != -1:
                 return result
             last_err = result
         except Exception as e:
             last_err = {"code": -1, "msg": f"proxy error: {e}", "result": None}
-        if attempt < 2:
-            # 当前代理池可能整体失效，丢弃后重新抓取一批新代理再试（应对某天免费代理集体挂掉）
-            print(f"[proxy] 请求失败，刷新代理池后重试 ({attempt+1}/3)...")
-            _proxy_client = None
-            time.sleep(3)
+            if proxies in _working_proxies:
+                _working_proxies.remove(proxies)
+    # 现有可用代理均失效，重新抓一批再试一次
+    if _refetch:
+        _working_proxies.clear()
+        print("[proxy] 可用代理均失效，重新抓取一批...")
+        return _proxy_request(method, path, body, _refetch=False)
     return last_err
 
 

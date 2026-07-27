@@ -4,11 +4,11 @@
 
 学校塔斯汀不让用团购，只能小程序点单。好在签到活动连续 7 天给 0 元券，但手动签太容易忘。于是逆向了小程序接口，写了这个自动签到脚本。
 
-**特色功能：**
+**功能概览：**
 
 1. ✅ GitHub Actions 定时执行 —— 免费、免服务器，每天多个时段自动签到（任一成功即可，代理临时失效也能自动补签）
 2. ✅ 活动 ID 自动发现 —— 跨月无需手动更新，脚本自动获取当月签到活动
-3. ✅ 国内代理绕过 WAF —— 阿里云 WAF 拦截海外 IP？自动切换国内免费代理
+3. ✅ 国内代理绕过 WAF —— 阿里云 WAF 拦截海外 IP？自动切换国内免费代理（改进版 freeproxy：ip2region 本地定位 + 找到可用即停，秒级完成）
 4. ✅ 邮件通知 —— Token 过期自动发邮件提醒，不怕断签
 5. ✅ 一键获取 Token —— 本地运行 `get_token.py`，CDP 被动截取，无需手动抓包
 
@@ -22,9 +22,14 @@
 
 1. 先尝试直连（本地运行时通常成功）
 2. 如果收到 403/405（WAF 拦截），自动切换到国内免费代理重试
-3. 代理来源：[pyfreeproxy](https://github.com/CharlesPikachu/freeproxy)，筛选中国大陆 HTTP/HTTPS 代理
+3. 代理来源：改进版 [freeproxy fork](https://github.com/LeapYa/freeproxy)，筛选中国大陆 HTTP/HTTPS 代理
 
-本地运行无需安装额外依赖（直连即可）。GitHub Actions 中会自动 `pip install pyfreeproxy`。
+关于代理库的改进（相比上游 [pyfreeproxy](https://github.com/CharlesPikachu/freeproxy)）：
+
+- **ip2region 本地离线定位**：上游对每个代理 IP 调用外部地理 API（ipinfo.io/ip-api.com 等，且每个 IP 最多重试 10 次），在 Actions 共享出口 IP 上被限速，几百个代理定位要几十分钟甚至数小时。改用 ip2region 本地 xdb 后单次查询约 10μs，彻底消除该瓶颈。
+- **找到可用即停**：`fetch_working` 直接拿塔斯汀接口作探针并发验证代理，凑够几个可用代理就立刻停止，不再跑完整个池子。
+
+综合下来，代理准备从原本的几十分钟~数小时压缩到秒级。本地运行无需安装额外依赖（直连即可）；GitHub Actions 中会自动从 fork 安装。
 
 ## 系统要求
 
@@ -248,8 +253,8 @@ A: Windows 10 1803（2018年4月更新）及以上版本自带 `tar.exe`。如�
 **Q: Actions 日志显示 HTTP 405 / HTML 页面**
 A: 这是阿里云 WAF 拦截了 GitHub Actions 的海外 IP。脚本已内置代理回退，会自动切换到国内代理重试。如果代理也全部失败，脚本会以“警告”（非失败）结束当次运行，当天后续的定时任务（9/12/15/18/21 点）会自动重试，通常能恢复，无需手动干预。
 
-**Q: 代理模式报错 "未安装 pyfreeproxy"**
-A: 本地运行时如果直连成功则不需要代理。如果你本地也被 WAF 拦截（比如用了海外 VPS），运行 `pip install pyfreeproxy` 即可。
+**Q: 代理模式报错 "未安装代理库"**
+A: 本地运行时如果直连成功则不需要代理。如果你本地也被 WAF 拦截（比如用了海外 VPS），运行 `pip install -r requirements.txt` 安装改进版 freeproxy 即可。
 
 ## 免责声明
 

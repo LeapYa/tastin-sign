@@ -12,9 +12,16 @@ on:
     - cron: "5 13 * * *"   # 北京 21:05
   workflow_dispatch: # 支持手动触发
 
+# 同一时刻只跑一个签到任务：新触发会取消仍在跑的旧任务，避免任务堆叠/长时间占用
+concurrency:
+  group: tastin-sign
+  cancel-in-progress: true
+
 jobs:
   sign:
     runs-on: ubuntu-latest
+    # 硬性超时兜底：正常几分钟完成，封顶 20 分钟仅防极端情况下长时间空跑
+    timeout-minutes: 20
     env:
       TZ: Asia/Shanghai
 

@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .env
 *.log
+# 本地 fork 克隆与临时产物（不入仓）
+_freeproxy_fork/
+*.xdb
