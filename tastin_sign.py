@@ -39,11 +39,11 @@ def _now() -> datetime:
 # 是否在 GitHub Actions 环境中运行（Actions 的海外 IP 必定被 WAF 拦截，直接走代理）
 _IN_ACTIONS = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
 
-# 触发本次运行的 cron 表达式（工作流通过 github.event.schedule 注入；手动触发/本地为空）。
-# 每天多个时段重试时，只让“首个时段(北京 9:05)”或手动/本地运行负责告警（标红 + 发邮件），
-# 其余时段即使检测到 token 过期/签到失败也静音退出，保证一天最多一封失败邮件。
-_CRON = os.environ.get("TASTIN_CRON", "").strip()
-_IS_PRIMARY_SLOT = (_CRON == "" or _CRON == "5 1 * * *")
+# 单时段方案：每天只用一个时段触发，靠“单次运行内多次指数退避重试”兜住偶发的代理失效，
+# 而不用一天多个时段（多时段容易被风控盯上）。
+_MAX_RETRIES = 5             # 单次运行内最多尝试次数
+_MAX_TOTAL_SECONDS = 900     # 总时长上限（秒），约 15 分钟
+_BACKOFF_BASE = 30           # 指数退避基数（秒）：30 / 60 / 120 / 240 ...
 
 # GitHub Actions 环境证书链可能不完整，跳过验证
 _ssl_ctx = ssl.create_default_context()
@@ -90,11 +90,11 @@ _proxy_client = None      # 复用同一个 ProxiedSessionClient（内含已抓�
 _working_proxies = []     # fetch_working 验证出的可用代理（requests 格式 dict 列表）
 _waf_blocked = False
 
-# 代理源：只用免浏览器抓取的国内源（快代理/齐云/开心/89ip/谷德/TheSpeedX/ProxyScrape）
+# 代理源：只用免浏览器抓取的国内源（快代理/齐云/开心/89ip/TheSpeedX/ProxyScrape）
+# 已剔除 GoodIPS：实测约 34s 且返回 0 个代理，纯浪费
 _PROXY_SOURCES = [
     "KuaidailiProxiedSession", "QiyunipProxiedSession", "KxdailiProxiedSession",
-    "IP89ProxiedSession", "GoodIPSProxiedSession", "TheSpeedXProxiedSession",
-    "ProxyScrapeProxiedSession",
+    "IP89ProxiedSession", "TheSpeedXProxiedSession", "ProxyScrapeProxiedSession",
 ]
 
 
@@ -154,7 +154,7 @@ def _get_working_proxies() -> list:
         except Exception:
             return False
 
-    print("[proxy] 正在抓取国内免费代理...")
+    print("[proxy] 并发抓取+验证国内免费代理（边抓边验，找到可用即停）...")
     _proxy_client = ProxiedSessionClient(
         proxy_sources=_PROXY_SOURCES,
         init_proxied_session_cfg={
@@ -162,12 +162,12 @@ def _get_working_proxies() -> list:
             "filter_rule": {"country_code": ["CN"], "protocol": ["http", "https"]},
         },
         disable_print=True,
+        lazy=True,  # 不在构造阶段抓取，交给 fetch_working_streaming 边抓边验、命中即停
     )
-    print("[proxy] 并发验证代理（找到可用即停）...")
-    _working_proxies = _proxy_client.fetch_working(
+    _working_proxies = _proxy_client.fetch_working_streaming(
         test_url=BASE_URL + "/api/wx/point/myPoint",
-        headers=HEADERS, need=3, max_workers=80, timeout=12,
-        method="POST", json_body={}, is_valid=_valid,
+        headers=HEADERS, need=3, source_timeout=15, validate_timeout=10,
+        validate_workers=64, method="POST", json_body={}, is_valid=_valid,
     )
     print(f"[proxy] 可用代理 {len(_working_proxies)} 个")
     return _working_proxies
@@ -346,6 +346,63 @@ def format_reward(result: dict) -> str:
 
 
 # ============ 主流程 ============
+def run_sign_once() -> tuple[str, str]:
+    """执行一次完整签到尝试。返回 (status, sign_msg)：
+      "ok"      - 签到成功或今天已签
+      "expired" - token 已失效（重试无意义，应立即人工处理）
+      "network" - 网络/代理故障（可重试）
+      "failed"  - 其它业务失败（可重试）
+    """
+    # 每次尝试都强制重新抓一批全新代理（上一批可能已失效）
+    _working_proxies.clear()
+
+    # 验证 token
+    print()
+    token_status = check_token()
+    if token_status == "network":
+        return "network", "网络/代理故障，无法连接服务器"
+    if token_status == "expired":
+        return "expired", "token 已失效"
+
+    # 自动发现当前签到活动 ID
+    print()
+    activity_id = discover_activity_id()
+
+    # 查询签到状态
+    print()
+    info = get_sign_info(activity_id)
+    if info:
+        act = info.get("activityInfo", {})
+        print(f"[info] 活动: {act.get('name', '未知')}")
+        print(f"[info] 每日签到: {'开启' if act.get('daySignOpen') else '关闭'}")
+
+    # 执行签到
+    print()
+    res = do_sign(activity_id)
+    if res.get("code") == 200 and res.get("result"):
+        print("[sign] 签到成功!")
+        print(format_reward(res["result"]))
+        sign_msg = f"签到成功！连续 {res['result'].get('continuousNum', '?')} 天"
+    elif res.get("msg") and ("签过" in res["msg"] or "已签" in res["msg"]):
+        print(f"[sign] 今天已经签过了: {res['msg']}")
+        sign_msg = "今天已经签过了"
+    elif _is_network_error(res):
+        print(f"[sign] 网络/代理故障，本次签到未完成（非账号问题）: {res.get('msg')}")
+        return "network", "网络/代理故障，签到未完成"
+    else:
+        sign_msg = res.get("msg", "未知错误")
+        print(f"[sign] 签到失败: {sign_msg}")
+        return "failed", sign_msg
+
+    # 最终积分
+    print()
+    final = api_request("POST", "/api/wx/point/myPoint", {})
+    if final.get("code") == 200 and final.get("result"):
+        print(f"[done] 当前积分: {final['result'].get('point', '?')}")
+    print("\n[done] 签到流程完成")
+    return "ok", sign_msg
+
+
 def main():
     print()
     print("===================================================================")
@@ -362,20 +419,26 @@ def main():
         print("请在 GitHub Settings > Secrets and variables > Actions 中配置")
         sys.exit(1)
 
-    # 1. 验证 token
-    print()
-    token_status = check_token()
-    if token_status == "network":
-        # 免费代理池当天可能整体失效，这不是 token 问题：不误报过期、也不发过期邮件。
-        # 工作流每天多个时段重试（见 tastin_sign.yml），本次跳过、稍后自动再签，
-        # 故以“成功”退出，避免把可自愈的网络抖动标记为失败、造成多次失败邮件骚扰。
-        print("\n[WARN] 网络/代理故障，本次无法连接塔斯汀服务器（token 未过期）")
-        print("[WARN] 通常是免费代理临时全部失效，无需更新 Secrets，稍后的定时任务会自动重试")
-        print("::warning::代理/网络故障，本次签到跳过，等待下一个定时任务重试（非 token 过期）")
-        sys.exit(0)
-    if token_status == "expired":
-        print("\n[ERROR] token 已失效，请重新抓包获取新 token 并更新 GitHub Secrets")
-        if _IS_PRIMARY_SLOT:
+    # 单次运行内最多重试 _MAX_RETRIES 次，指数退避，总时长不超过 _MAX_TOTAL_SECONDS
+    import time
+    start = time.monotonic()
+    last_status, last_msg = "network", ""
+    for attempt in range(1, _MAX_RETRIES + 1):
+        print(f"\n========== 第 {attempt}/{_MAX_RETRIES} 次尝试 ==========")
+        last_status, last_msg = run_sign_once()
+
+        if last_status == "ok":
+            if SMTP_NOTIFY_SIGN:
+                send_email(
+                    "✅ 塔斯汀签到成功",
+                    f"<h3>塔斯汀每日签到</h3><p><b>{last_msg}</b></p>"
+                    f"<p><small>时间: {_now().strftime('%Y-%m-%d %H:%M:%S')}</small></p>",
+                )
+            return  # 正常退出（exit 0）
+
+        if last_status == "expired":
+            # token 失效，重试无意义：立即报错并发邮件提醒更新 Secret
+            print("\n[ERROR] token 已失效，请重新抓包获取新 token 并更新 GitHub Secrets")
             print("::error::塔斯汀 token 已过期，需要手动更新！")
             send_email(
                 "⚠️ 塔斯汀签到 Token 已过期",
@@ -386,77 +449,27 @@ def main():
                 f"<p><small>时间: {_now().strftime('%Y-%m-%d %H:%M:%S')}</small></p>",
             )
             sys.exit(1)
-        # 非首个时段：只提示，不标红、不发邮件（每天 9:05 首个时段已负责告警），避免一天多封
-        print("::warning::token 已过期，本时段静音（每天首个时段 9:05 已负责告警）")
-        sys.exit(0)
 
-    # 2. 自动发现当前签到活动 ID
-    print()
-    activity_id = discover_activity_id()
+        # network / failed —— 可重试；指数退避，但不超过总时长上限
+        if attempt < _MAX_RETRIES:
+            delay = min(_BACKOFF_BASE * (2 ** (attempt - 1)), 600)
+            if time.monotonic() - start + delay >= _MAX_TOTAL_SECONDS:
+                print("[retry] 已接近总时长上限，停止重试")
+                break
+            print(f"[retry] 第 {attempt} 次未成功（{last_status}: {last_msg}），{delay}s 后重试...")
+            time.sleep(delay)
 
-    # 3. 查询签到状态
-    print()
-    info = get_sign_info(activity_id)
-    if info:
-        act = info.get("activityInfo", {})
-        print(f"[info] 活动: {act.get('name', '未知')}")
-        print(f"[info] 每日签到: {'开启' if act.get('daySignOpen') else '关闭'}")
-
-    # 4. 执行签到
-    print()
-    res = do_sign(activity_id)
-    sign_ok = False
-    sign_msg = ""
-    if res.get("code") == 200 and res.get("result"):
-        print("[sign] 签到成功!")
-        reward_text = format_reward(res["result"])
-        print(reward_text)
-        sign_ok = True
-        sign_msg = f"签到成功！连续 {res['result'].get('continuousNum', '?')} 天"
-    elif res.get("msg") and ("签过" in res["msg"] or "已签" in res["msg"]):
-        print(f"[sign] 今天已经签过了: {res['msg']}")
-        sign_ok = True
-        sign_msg = "今天已经签过了"
-    elif _is_network_error(res):
-        # 网络/代理故障，并非真正的签到失败：本次跳过、等待下一个定时任务重试，以成功退出避免误导性告警
-        print(f"[sign] 网络/代理故障，本次签到未完成（非账号问题）: {res.get('msg')}")
-        print("::warning::代理/网络故障，本次签到跳过，等待下一个定时任务重试")
-        sys.exit(0)
-    else:
-        sign_msg = res.get("msg", "未知错误")
-        print(f"[sign] 签到失败: {sign_msg}")
-        if _IS_PRIMARY_SLOT:
-            print("::error::签到失败，请检查日志")
-            if SMTP_NOTIFY_SIGN:
-                send_email(
-                    "❌ 塔斯汀签到失败",
-                    f"<h3>塔斯汀签到失败</h3><p>错误信息: {sign_msg}</p>"
-                    f"<p><small>时间: {_now().strftime('%Y-%m-%d %H:%M:%S')}</small></p>",
-                )
-            sys.exit(1)
-        # 非首个时段：静音退出，避免一天多封失败邮件
-        print("::warning::签到失败，本时段静音（每天首个时段 9:05 已负责告警）")
-        sys.exit(0)
-
-    # 5. 最终积分
-    print()
-    point_text = ""
-    final = api_request("POST", "/api/wx/point/myPoint", {})
-    if final.get("code") == 200 and final.get("result"):
-        point_text = f"当前积分: {final['result'].get('point', '?')}"
-        print(f"[done] {point_text}")
-
-    print("\n[done] 签到流程完成")
-
-    # 6. 发送成功通知（仅在开启 SMTP_NOTIFY_SIGN 且为每天首个时段/手动触发时，避免一天多封）
-    if SMTP_NOTIFY_SIGN and _IS_PRIMARY_SLOT:
+    # 所有重试用尽仍失败 —— 直接报错（红叉 + 邮件）
+    print(f"\n[ERROR] 已尝试 {_MAX_RETRIES} 次仍未成功（最后状态: {last_status} - {last_msg}）")
+    print("::error::签到失败，多次重试仍未成功，请检查日志")
+    if SMTP_NOTIFY_SIGN:
         send_email(
-            "✅ 塔斯汀签到成功",
-            f"<h3>塔斯汀每日签到</h3>"
-            f"<p><b>{sign_msg}</b></p>"
-            f"<p>{point_text}</p>"
+            "❌ 塔斯汀签到失败",
+            f"<h3>塔斯汀签到失败</h3><p>已重试 {_MAX_RETRIES} 次仍未成功</p>"
+            f"<p>最后错误: {last_msg}</p>"
             f"<p><small>时间: {_now().strftime('%Y-%m-%d %H:%M:%S')}</small></p>",
         )
+    sys.exit(1)
 
 
 if __name__ == "__main__":

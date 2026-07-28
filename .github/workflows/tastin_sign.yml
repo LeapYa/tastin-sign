@@ -3,13 +3,9 @@ name: 塔斯汀每日签到
 on:
   schedule:
     # GitHub Actions 使用 UTC 时间，北京时间 = UTC + 8。
-    # 每天多个时段各跑一次，任一成功即可；已签到的后续运行会自动识别并跳过。
-    # 某个时段免费代理全挂也没关系，稍后的时段会自动重试，尽量避免漏签。
-    - cron: "5 1 * * *"    # 北京 09:05
-    - cron: "5 4 * * *"    # 北京 12:05
-    - cron: "5 7 * * *"    # 北京 15:05
-    - cron: "5 10 * * *"   # 北京 18:05
-    - cron: "5 13 * * *"   # 北京 21:05
+    # 排在北京 06:05（对应 22:05 UTC）——GitHub 定时常延迟数小时，排早些让实际签到尽量落在上午；
+    # 用非整点分钟减少排队拥堵。单次运行内指数退避重试（最多 5 次、总时长上限 15 分钟）兜底。
+    - cron: "5 22 * * *"    # 北京 06:05
   workflow_dispatch: # 支持手动触发
 
 # 同一时刻只跑一个签到任务：新触发会取消仍在跑的旧任务，避免任务堆叠/长时间占用
@@ -20,7 +16,7 @@ concurrency:
 jobs:
   sign:
     runs-on: ubuntu-latest
-    # 硬性超时兜底：正常几分钟完成，封顶 20 分钟仅防极端情况下长时间空跑
+    # 硬性超时兜底：正常几分钟完成；封顶 20 分钟（重试窗口约 15 分钟 + 装依赖等开销）
     timeout-minutes: 20
     env:
       TZ: Asia/Shanghai
@@ -55,7 +51,4 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
           SMTP_NOTIFY_SIGN: ${{ secrets.SMTP_NOTIFY_SIGN || '' }}
-          # 把触发本次运行的 cron 传给脚本；手动触发时为空。
-          # 脚本据此只让“首个时段(9:05)”或手动运行标红/发邮件，保证一天最多一封失败邮件。
-          TASTIN_CRON: ${{ github.event.schedule }}
         run: python tastin_sign.py
